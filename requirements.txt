@@ -1,6 +1,7 @@
 streamlit
-yfinance>=0.2.0
-prophet
-plotly
+yfinance
 pandas
-scipy
+plotly
+torch
+transformers
+chronos-forecasting
