@@ -2,6 +2,4 @@ streamlit
 yfinance
 pandas
 plotly
-torch
-transformers
-chronos-forecasting
+scipy
