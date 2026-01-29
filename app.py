@@ -2,90 +2,119 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
+from prophet import Prophet
 from scipy.stats import norm
+import plotly.graph_objs as go
 from datetime import timedelta
 
-st.set_page_config(page_title="USDJPY 120分予測", layout="wide")
+# --- ページ設定 ---
+st.set_page_config(page_title="USD/JPY 短期決着予測", layout="wide")
 
-st.title("📈 USD/JPY 5分足 方向予測 (期間カスタマイズ版)")
+st.title("⚡ USD/JPY 5分足 短期決着予測")
+st.markdown("10〜15pipsの利益を狙うための、最大30分後までの超短期予測モデルです。")
 
-# サイドバー設定
-st.sidebar.header("分析設定")
-lookback = st.sidebar.select_slider("分析対象件数 (過去データ)", options=[256, 512, 1024], value=512)
-
-# --- 予測期間の設定を「分単位」に変更 ---
-# 15分から240分まで、15分刻みで設定可能にしました
-predict_minutes = st.sidebar.slider("予測期間 (分後)", min_value=15, max_value=240, value=120, step=15)
-# 5分足の本数に換算
+# --- サイドバー設定 ---
+st.sidebar.header("スキャルピング設定")
+# 期間を5分〜30分に限定
+predict_minutes = st.sidebar.slider("予測完了までの時間 (分後)", min_value=5, max_value=30, value=15, step=5)
 horizon = predict_minutes // 5
 
-span = st.sidebar.slider("直近感度 (小さいほど急変に敏感)", 10, 100, 30)
+# 短期決着なので、直近の動きへの感度を高く設定可能に
+trend_sensitivity = st.sidebar.slider("トレンド追従感度", 0.05, 0.50, 0.25, step=0.05)
+entry_threshold = st.sidebar.radio("エントリー基準勝率 (%)", [60, 65, 70], index=1, horizontal=True)
 
-update_btn = st.sidebar.button("最新価格で予測更新")
+update_btn = st.sidebar.button("最新の勢いを解析")
 
-@st.cache_data(ttl=300)
-def get_fx_data(n):
+# --- データ取得 ---
+@st.cache_data(ttl=60) # 短期なのでキャッシュ時間を1分に短縮
+def get_short_term_data(n=300):
     try:
-        df = yf.download("USDJPY=X", interval="5m", period="5d")
-        if df.empty: return None, None
+        # 短期予測には直近数日分あれば十分
+        df = yf.download("USDJPY=X", interval="5m", period="2d", progress=False)
+        if df.empty: return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        df = df.iloc[:-1].tail(n)
-        return df, float(df['Close'].iloc[-1])
+        df = df.reset_index().rename(columns={'Datetime': 'ds', 'Close': 'y'})
+        df['ds'] = pd.to_datetime(df['ds']).dt.tz_convert('Asia/Tokyo').dt.tz_localize(None)
+        return df.tail(n)
     except:
-        return None, None
+        return None
 
+# --- メイン処理 ---
 if update_btn:
-    with st.spinner(f"{predict_minutes}分後の着地を計算中..."):
-        df, price = get_fx_data(lookback)
+    with st.spinner(f'{predict_minutes}分以内の決着ポイントを計算中...'):
+        df = get_short_term_data()
         if df is not None:
-            last_time_jst = df.index[-1] + timedelta(hours=9)
+            # 1. Prophetによる短期学習
+            # changepoint_prior_scale を高くして直近の動きに敏感に反応させる
+            m = Prophet(changepoint_prior_scale=trend_sensitivity, daily_seasonality=True)
+            m.fit(df[['ds', 'y']])
             
-            # EWMAによるボラティリティ計算
-            returns = np.log(df['Close'] / df['Close'].shift(1)).dropna()
-            latest_vol = np.sqrt(returns.ewm(span=span).var().iloc[-1])
-            h_vol = latest_vol * np.sqrt(horizon)
+            future = m.make_future_dataframe(periods=horizon + 2, freq='5min')
+            forecast = m.predict(future)
             
-            # 方向確率
-            prob_up_base = (1 - norm.cdf(0, loc=0, scale=h_vol)) * 100
-            prob_down_base = 100 - prob_up_base
-
-            # ターゲット別勝率
-            def calc_target_win_rate(pips):
-                target_ret = np.log((price + (pips * 0.01)) / price)
-                if pips > 0:
-                    return (1 - norm.cdf(target_ret, loc=0, scale=h_vol)) * 100
-                else:
-                    return norm.cdf(target_ret, loc=0, scale=h_vol) * 100
-
-            p15_u, p10_u = round(calc_target_win_rate(15), 1), round(calc_target_win_rate(10), 1)
-            p10_d, p15_d = round(calc_target_win_rate(-10), 1), round(calc_target_win_rate(-15), 1)
-
-            # --- 表示 ---
-            st.success(f"現在価格: {price:.3f} | 日本時間: {last_time_jst.strftime('%H:%M')}")
+            current_price = float(df['y'].iloc[-1])
+            last_time = df['ds'].iloc[-1]
+            predicted_price = float(forecast.iloc[-1]['yhat'])
             
-            st.subheader(f"🎯 方向予測 ({predict_minutes}分後の着地確率)")
-            c1, c2 = st.columns(2)
-            c1.metric("上昇する確率", f"{prob_up_base:.1f}%")
-            c2.metric("下落する確率", f"{prob_down_base:.1f}%")
+            # 2. 超短期ボラティリティ (直近20本=100分に集中)
+            recent_returns = np.log(df['y'] / df['y'].shift(1)).dropna().tail(20)
+            vol = recent_returns.std()
+            h_vol = vol * np.sqrt(horizon)
+            
+            # 3. 勝率(期待方向)の計算
+            target_ret = np.log(predicted_price / current_price)
+            prob_up = (1 - norm.cdf(0, loc=target_ret, scale=h_vol)) * 100
+            prob_down = 100 - prob_up
+            
+            # --- UI表示 ---
+            jst_now = last_time + timedelta(hours=0)
+            st.success(f"現在値: {current_price:.3f} | 日本時間: {jst_now.strftime('%H:%M')}")
+            
+            st.subheader(f"🎯 {predict_minutes}分後の着地期待度")
+            col1, col2 = st.columns(2)
+            
+            status_up = "🚀 BUY CHANCE" if prob_up >= entry_threshold else ""
+            status_down = "📉 SELL CHANCE" if prob_down >= entry_threshold else ""
+            col1.metric("上昇勝率", f"{prob_up:.1f}%", status_up)
+            col2.metric("下落勝率", f"{prob_down:.1f}%", status_down)
 
-            # 棒グラフ
-            fig_bar = go.Figure(data=[go.Bar(
-                x=['+15 pips 以上', '+10 pips 以上', '-10 pips 以下', '-15 pips 以下'],
-                y=[p15_u, p10_u, p10_d, p15_d],
-                marker_color=['#00cc66', '#00cc66', '#ff3300', '#ff3300'],
-                text=[f"{x}%" for x in [p15_u, p10_u, p10_d, p15_d]],
-                textposition='auto'
-            )])
-            fig_bar.update_layout(template="plotly_dark", yaxis=dict(title="勝率 (%)", range=[0, 100]), height=400)
+            # ターゲット勝率グラフ
+            st.markdown(f"#### {predict_minutes}分以内に10〜15pips圏内へ到達する確率")
+            t_pips = [15, 10, -10, -15]
+            t_labels = ["+15pips", "+10pips", "-10pips", "-15pips"]
+            t_probs = []
+            for tp in t_pips:
+                t_ret = np.log((current_price + (tp * 0.01)) / current_price)
+                # 分布の中心(loc)にAI予測の勢いを含める
+                p = (1 - norm.cdf(t_ret, loc=target_ret, scale=h_vol)) * 100
+                t_probs.append(p if tp > 0 else 100 - p)
+
+            fig_bar = go.Figure(go.Bar(
+                x=t_labels, y=t_probs,
+                marker_color=['#00cc96', '#00cc96', '#ff4b4b', '#ff4b4b'],
+                text=[f"{p:.1f}%" for p in t_probs], textposition='auto'
+            ))
+            fig_bar.update_layout(template="plotly_dark", height=350, yaxis=dict(range=[0, 100]))
             st.plotly_chart(fig_bar, use_container_width=True)
 
-            # チャート
-            st.subheader("📊 価格推移とターゲットライン")
+            # チャート表示
             fig_chart = go.Figure()
-            fig_chart.add_trace(go.Scatter(x=df.index, y=df['Close'], name="実績", line=dict(color="#00fbff")))
-            for p, c, d in [(0.15, "#00cc66", "dot"), (0.1, "#00cc66", "dash"), (-0.1, "#ff3300", "dash"), (-0.15, "#ff3300", "dot")]:
-                fig_chart.add_hline(y=price + p, line_dash=d, line_color=c)
-            fig_chart.update_layout(template="plotly_dark", height=500, xaxis_rangeslider_visible=False)
+            # 表示範囲を直近2時間分に絞って見やすく
+            display_df = df.tail(24) 
+            fig_chart.add_trace(go.Scatter(x=display_df['ds'], y=display_df['y'], name="実績", line=dict(color="#00fbff")))
+            # AIの予測軌道
+            pred_future = forecast[forecast['ds'] >= last_time].head(horizon + 1)
+            fig_chart.add_trace(go.Scatter(x=pred_future['ds'], y=pred_future['yhat'], name="AI推論パス", line=dict(color="yellow", dash="dot")))
+            
+            # ターゲットライン
+            for tp, color in [(0.10, "#00cc96"), (-0.10, "#ff4b4b")]:
+                fig_chart.add_hline(y=current_price + tp, line_dash="dash", line_color=color, opacity=0.5)
+
+            fig_chart.update_layout(template="plotly_dark", height=450, xaxis_rangeslider_visible=False)
             st.plotly_chart(fig_chart, use_container_width=True)
+            
+        else:
+            st.error("データの取得に失敗しました。")
+else:
+    st.info("「最新の勢いを解析」ボタンを押して、超短期の勝機を判定します。")
